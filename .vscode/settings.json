@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "/opt/autoresearch-venv/bin/python",
+    "terminal.integrated.env.linux": {
+        "UV_PROJECT_ENVIRONMENT": "/opt/autoresearch-venv",
+        "UV_CACHE_DIR": "/opt/autoresearch-cache/uv"
+    }
+}
