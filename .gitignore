@@ -8,9 +8,24 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local credentials (example templates can be committed)
+.env
+.env.*
+!.env.example
+
+# Local caches
+.cache/
+.ipynb_checkpoints/
+
+# Generated research files
 worktrees/
 results/
 queue/
+*.log
+
+# Editor workspace files
+*.code-workspace
 
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
@@ -19,5 +34,8 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 
-# Results file
+# Per-pod setup scripts (not part of the project, GPU-pod-specific)
+scripts/
+
+# Results files
 results.tsv
