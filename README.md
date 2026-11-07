@@ -1,16 +1,27 @@
 # Autoresearch
 
-Single-GPU LLM training experiments powered by a Copilot SDK agent. The agent
-changes [train.py](train.py), measures validation bits per byte (**val_bpb**),
-and keeps or rejects each change. Lower is better.
+Single-GPU LLM training experiments powered by Copilot SDK agents. Agents change
+[train.py](train.py) to search for better architectures and hyperparameters
+within a fixed training time budget. Validation bits per byte (**val_bpb**)
+is the score; lower is better. The same population loop supports one or many agents.
 
 ## Setup
 
-Requires Linux, Bash, Git, GNU coreutils, an NVIDIA GPU compatible with CUDA 12.8,
+Requires Linux, Bash, Git, an NVIDIA GPU compatible with CUDA 12.8,
 [uv](https://docs.astral.sh/uv/getting-started/installation/), and Copilot access.
 Python 3.11 is selected by [.python-version](.python-version).
 
 From the repository root:
+
+```bash
+bash scripts/pod-init.sh
+```
+
+This installs dependencies and prepares the data using the shared `/opt` paths
+expected by the launcher. It is safe to rerun and saves both uv path settings
+in `~/.bashrc` for new shells. It does not change the current shell's environment.
+
+Alternatively, run the setup commands manually:
 
 ```bash
 export UV_PROJECT_ENVIRONMENT=/opt/autoresearch-venv
@@ -22,8 +33,21 @@ uv sync --locked
 The `/opt` locations must be writable. Keep both `UV_` variables set when using
 `uv`. Data and tokenizer files are cached in `~/.cache/autoresearch/`.
 
-In VS Code, select `/opt/autoresearch-venv/bin/python` for Python and notebooks.
-The workspace settings use this environment by default.
+The development dependencies include `ipykernel` for notebooks. Register the
+project kernel once:
+
+```bash
+/opt/autoresearch-venv/bin/python -m ipykernel install --user \
+  --name autoresearch --display-name "Python (autoresearch)"
+```
+
+In VS Code, select `/opt/autoresearch-venv/bin/python` for Python and
+`Python (autoresearch)` for notebooks. The workspace settings use this Python
+environment by default.
+
+The [workspace settings](.vscode/settings.json) set
+`python.analysis.typeCheckingMode` to `off` for these experimental scripts.
+Syntax and missing-import diagnostics remain enabled; no local type stubs are needed.
 
 Sign in with the Copilot CLI, or set `COPILOT_GITHUB_TOKEN` in the local,
 Git-ignored `agent/.env`. The launcher loads it automatically; existing
@@ -39,20 +63,33 @@ bash agent/run.sh --dry-run
 # List available models and reasoning levels
 bash agent/run.sh --list-models
 
-# Run a baseline plus up to three candidate attempts (default)
-bash agent/run.sh --allow-all-tools
+# Two different agents, keeping the best two scripts
+bash agent/run.sh --allow-all-tools \
+  --models MODEL_A MODEL_B --keep 2 --rounds 2
 
-# Choose the attempt count and model
-bash agent/run.sh --allow-all-tools --experiments 1 \
+# Run the same loop with just one agent
+bash agent/run.sh --allow-all-tools --agents 1 --keep 1 --rounds 2 \
   --model MODEL_ID --reasoning-effort high
 
 # All options
 bash agent/run.sh --help
 ```
 
-Replace `MODEL_ID` with an available model and choose a supported reasoning level.
-Omit both options for SDK defaults. Use `--experiments 0` for a baseline only.
-Crashes and repair retries count toward the attempt limit.
+Replace the model placeholders with IDs from `--list-models`. `--models` takes one
+ID per agent; its order stays fixed across rounds. Repeating an ID creates another
+independent agent using that model. Omit `--agents` to use the list length, or set it
+to the same count. Use either `--models` or the shared `--model`, not both.
+Without either option, agents use SDK defaults.
+
+An optional `--reasoning-effort` applies to every agent and must be supported by
+every selected model. Omit it to use each model's default. All selected models
+are validated before any training. Add `--dry-run` to preview the assignments
+without authentication or GPU work.
+
+The launcher now always uses the population loop. Existing
+`bash agent/run.sh population ...` commands still work, but the prefix is optional.
+The old Git-commit/TSV workflow and `--experiments` option have been retired.
+Use `--rounds`, or `--rounds 0` for a baseline only.
 
 To run training without the agent:
 
@@ -60,33 +97,91 @@ To run training without the agent:
 /opt/autoresearch-venv/bin/python -u train.py
 ```
 
-**This is not a sandbox:** autonomous tools have your account's access. Use a
-dedicated machine and run only one training process or agent on the GPU.
-Live research requires `--allow-all-tools`.
+**This is not a sandbox:** autonomous tools and generated training code have your
+account's access. Use a dedicated machine and reserve the GPU for one research run
+at a time. Live research requires `--allow-all-tools`.
 
-## Results and limits
+## How the loop works
 
-```bash
-tail -F run.log
-```
+The coordinator is ordinary Python in [agent/population.py](agent/population.py),
+not another AI agent. [agent/sdk.py](agent/sdk.py) contains only environment loading,
+Copilot authentication/model checks, and proposal sessions. One `Trial` record
+follows each script through proposal, training, and selection. The baseline runs
+once before the round loop. Both use the same evaluation and logging functions:
 
-- `run.log`: current training output.
-- `results/<run-tag>/`: archived baseline and attempt logs.
-- `results.tsv`: appended metrics and `keep`, `discard`, or `crash` outcomes.
-- [analysis.ipynb](analysis.ipynb): results analysis and plotting.
+1. Copy the current working tree's training script and run one fresh baseline.
+2. At the start of each round, each agent independently samples a parent from the
+   previous winners, uniformly **with replacement**. Initially only the baseline
+   is available.
+3. Give each agent its own directory containing a copy of the complete parent
+   script. Fresh Copilot sessions reason and edit **concurrently**. Each gets the
+   parent score and its own five most recent attempts, not other agents' reasoning.
+   Each keeps its assigned model, even when inheriting code written by another
+   agent using a different model.
+4. After the proposals finish, Python runs their training jobs **one at a time**.
+   Every job starts from fresh weights and uses the same fixed evaluator and
+   configured training budget. The Python environment and cached data are shared,
+   not copied. Agents have only file-view/edit tools; they do not launch training.
+5. Keep up to `--keep` distinct scripts with the lowest scores from **previous
+   winners plus successful new candidates**. Exact source duplicates occupy one
+   slot; incumbent winners win score ties. Copy winners for the next round rather
+   than editing their archived scripts.
 
-Each launch requests a fresh baseline and a bounded set of candidates on a new
-branch. The agent follows [program.md](program.md) with launcher overrides,
-editing and committing only [train.py](train.py). Start with no edits to that
-file and no staged changes.
+Edit [program.md](program.md) to change the agents' shared research instructions.
+The coordinator reads it once at the start of each run and supplies its complete
+text as the system-message instructions for every proposal session. Each agent
+also gets its parent assignment and its own recent history. Changes made during
+a run apply only to the next run. `--dry-run` displays the current instructions;
+a missing or empty file is an error. Python still handles training and selection.
 
-Training has a 300-second budget plus startup and evaluation, with a 600-second
-command timeout. The SDK allows 15 minutes per planned invocation.
-Experiment rules are agent instructions, not independently enforced checks;
-a successful session exit does not mean every experiment succeeded.
+Without `--models`, defaults are four agents, two winners, five rounds, and
+sampling seed 42. This is one baseline plus at most 20 candidate training runs.
+`--keep` must be between one and the agent count; the pool can contain fewer
+winners until enough distinct successful scripts exist. `--rounds 0` runs only
+the baseline. The seed reproduces
+parent sampling given the same winners, not LLM proposals or wall-clock GPU runs.
 
-Ctrl+C requests an abort, but tool-launched training may remain running.
-Check remaining processes before restarting. There is no automatic retry or resume.
+Each agent gets one attempt per round. Proposal errors, empty/unchanged proposals,
+timeouts, nonzero training exits, missing/duplicate/nonfinite/nonpositive metrics,
+or changes to the fixed helper files are failures, never winners. There are no automatic retries.
+A failed baseline stops the run; failed candidates leave previous winners eligible.
+Proposal turns have a 15-minute timeout and training commands a 600-second timeout.
+The agents must preserve the training/evaluation protocol within their script;
+this is an experiment workflow, not an adversarial-code sandbox.
+
+## Results
+
+Everything is stored under a new Git-ignored `results/population-<timestamp>/`:
+
+- `config.json`: run settings, including the model list in agent order.
+- `program.md`: the exact shared instructions used for this run.
+- `baseline/` and `rNNN-aNNN/`: individual script snapshots and fixed helpers;
+  `train.log` contains training output. Candidate directories also contain the
+  proposal prompt in `prompt.txt` and SDK output in `agent.log`.
+- `results.jsonl`: one record per completed attempt, with agent, round, parent,
+  score, explanation, model, and explicit success/failure.
+  Failed scores are `null`, never a misleading zero. Each candidate records the
+  model that proposed it, not its parent's model. The baseline has `model: null`
+  because it is run by Python without an AI proposal.
+- `pool.json`: atomically updated after each completed round, listing the current
+  winners, their scores, and script paths relative to the run directory.
+
+The final console output identifies the best script. No Git branches or commits
+are created, and the repository's original [train.py](train.py), `run.log`, and
+`results.tsv` are not replaced. Existing uncommitted code is copied as the baseline,
+not reset. Ctrl+C aborts active proposal sessions and stops the coordinator-owned
+training process group; completed results and partial logs remain. There is no
+automatic resume.
+
+Only one GPU training worker is implemented. It uses the first GPU visible to
+the process (respecting `CUDA_VISIBLE_DEVICES`). Multi-GPU scheduling can later
+replace the serial training stage without changing parent selection or reasoning.
+
+Open [analysis.ipynb](analysis.ipynb) and run all cells to read the existing
+`results/*/results.jsonl` files directly, without an export or helper script.
+The notebook summarizes runs and models, compares candidates with their recorded
+parents, and plots the latest run by default; set `RUN` to view another run.
+It saves `progress.png` without changing the logs or the legacy `results.tsv`.
 
 ## Credits
 

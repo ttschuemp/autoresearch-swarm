@@ -34,7 +34,7 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 
-# Per-pod setup scripts (not part of the project, GPU-pod-specific)
+# Per-pod scripts
 scripts/
 
 # Results files
