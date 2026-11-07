@@ -454,7 +454,7 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" if fa3 is not None else "L" # L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**14 # ~32K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**15 # ~32K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -467,7 +467,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 6               # number of transformer layers
-DEVICE_BATCH_SIZE = 128 if torch.cuda.get_device_properties(0).total_memory >= 40 * 2**30 else 8
+DEVICE_BATCH_SIZE = 128 if torch.cuda.get_device_properties(0).total_memory >= 40 * 2**30 else 16
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
