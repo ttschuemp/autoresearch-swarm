@@ -11,11 +11,14 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import gc
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, asdict
+from typing import overload
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch._VF import _foreach_copy_
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 cap = torch.cuda.get_device_capability()
@@ -28,14 +31,14 @@ else:
     fa3 = None
 
 
-@torch.compiler.disable
+@torch.compiler.disable()
 def causal_attention(q, k, v, window_size):
     if fa3 is not None:
         return fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
     return fallback_causal_attention(q, k, v, window_size)
 
 
-@torch.compiler.disable
+@torch.compiler.disable()
 def fallback_causal_attention(q, k, v, _window_size):
     q, k, v = (tensor.transpose(1, 2) for tensor in (q, k, v))
     with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
@@ -101,6 +104,7 @@ class CausalSelfAttention(nn.Module):
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
+            assert self.ve_gate is not None, "Value embeddings require a gate in this layer"
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
@@ -168,40 +172,40 @@ class GPT(nn.Module):
     @torch.no_grad()
     def init_weights(self):
         # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(self.transformer["wte"].get_parameter("weight"), mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         # Transformer blocks
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        for block in self.transformer["h"].children():
+            torch.nn.init.uniform_(block.get_parameter("attn.c_q.weight"), -s, s)
+            torch.nn.init.uniform_(block.get_parameter("attn.c_k.weight"), -s, s)
+            torch.nn.init.uniform_(block.get_parameter("attn.c_v.weight"), -s, s)
+            torch.nn.init.zeros_(block.get_parameter("attn.c_proj.weight"))
+            torch.nn.init.uniform_(block.get_parameter("mlp.c_fc.weight"), -s, s)
+            torch.nn.init.zeros_(block.get_parameter("mlp.c_proj.weight"))
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         # Value embeddings
         for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+            torch.nn.init.uniform_(ve.get_parameter("weight"), -s, s)
         # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        for i, block in enumerate(self.transformer["h"].children()):
+            if has_ve(i, self.config.n_layer):
+                torch.nn.init.zeros_(block.get_parameter("attn.ve_gate.weight"))
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
+        self.transformer["wte"].to(dtype=torch.bfloat16)
         for ve in self.value_embeds.values():
             ve.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
-            device = self.transformer.wte.weight.device
+            device = self.transformer["wte"].get_parameter("weight").device
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
         inv_freq = 1.0 / (base ** (channel_range / head_dim))
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
@@ -227,8 +231,8 @@ class GPT(nn.Module):
     def estimate_flops(self):
         """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+        value_embeds_numel = sum(ve.get_parameter("weight").numel() for ve in self.value_embeds.values())
+        nparams_exclude = (self.transformer["wte"].get_parameter("weight").numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
@@ -241,10 +245,10 @@ class GPT(nn.Module):
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def num_scaling_params(self):
-        wte = sum(p.numel() for p in self.transformer.wte.parameters())
+        wte = sum(p.numel() for p in self.transformer["wte"].parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        transformer_matrices = sum(p.numel() for p in self.transformer["h"].parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         return {
@@ -255,9 +259,9 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = list(self.transformer["h"].parameters())
         value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
+        embedding_params = list(self.transformer["wte"].parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
@@ -289,10 +293,10 @@ class GPT(nn.Module):
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
-        x = self.transformer.wte(idx)
+        x = self.transformer["wte"](idx)
         x = norm(x)
         x0 = x
-        for i, block in enumerate(self.transformer.h):
+        for i, block in enumerate(self.transformer["h"].children()):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
@@ -434,15 +438,26 @@ class MuonAdamW(torch.optim.Optimizer):
                         state["momentum_buffer"], state["second_momentum_buffer"],
                         self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
                         self._muon_beta2_t, group["ns_steps"], red_dim)
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+        _foreach_copy_(params, list(stacked_params.unbind(0)))
+
+    @overload
+    def step(self, closure: None = None) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float: ...
 
     @torch.no_grad()
-    def step(self):
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
         for group in self.param_groups:
             if group['kind'] == 'adamw':
                 self._step_adamw(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
+        return loss
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
@@ -478,7 +493,7 @@ torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
@@ -524,7 +539,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+model.compile(dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -562,6 +577,7 @@ step = 0
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
+    train_loss = None
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
@@ -569,6 +585,9 @@ while True:
         loss = loss / grad_accum_steps
         loss.backward()
         x, y, epoch = next(train_loader)
+
+    if train_loss is None:
+        raise ValueError("TOTAL_BATCH_SIZE must include at least one microbatch.")
 
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)

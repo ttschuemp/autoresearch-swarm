@@ -6,4 +6,9 @@ if [ ! -x /opt/autoresearch-venv/bin/python ]; then
     exit 1
 fi
 
-exec /opt/autoresearch-venv/bin/python "$(dirname -- "$0")/main.py" "$@"
+if [ "${1:-}" = "population" ]; then
+    shift
+fi
+
+cd "$(dirname -- "$0")/.."
+exec /opt/autoresearch-venv/bin/python -m agent.population "$@"
