@@ -181,6 +181,11 @@ Open [analysis.ipynb](analysis.ipynb) and run all cells to read the existing
 `results/*/results.jsonl` files directly, without an export or helper script.
 The notebook summarizes runs and models, compares candidates with their recorded
 parents, and plots the latest run by default; set `RUN` to view another run.
+The chart shows every agent's score by experiment round, coloring candidates kept
+after their own round, greying out discarded candidates, and using hollow markers
+for results awaiting selection. Colors and marker shapes distinguish agents.
+Selection reuses the coordinator's rules with archived scripts, `config.json`,
+and `pool.json`, including script deduplication and incumbent score ties.
 It saves `progress.png` without changing the logs or the legacy `results.tsv`.
 
 ## Credits
