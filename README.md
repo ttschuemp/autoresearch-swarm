@@ -1,4 +1,4 @@
-# Autoresearch
+# Autoresearch Swarm
 
 A small, educational project for running autonomous LLM training experiments on
 one GPU. Copilot SDK agents modify [train.py](train.py), measure the results, and
