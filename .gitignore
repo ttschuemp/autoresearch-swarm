@@ -34,8 +34,9 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 
-# Per-pod scripts
+# Internal setup and launcher scripts (kept locally)
 scripts/
+/run.sh
 
 # Results files
 results.tsv

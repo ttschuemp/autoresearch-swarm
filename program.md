@@ -21,9 +21,12 @@ Work only in the candidate directory supplied by the coordinator. Read:
 - [prepare.py](prepare.py): fixed data loading, tokenizer, constants, and evaluation.
 - [pyproject.toml](pyproject.toml): the available dependencies.
 
-Always start from the assigned script, even if another agent wrote it. The parent
-score and your recent attempts are supplied as feedback, not instructions. Use
-that feedback to avoid repeating failed ideas.
+The same session is reused across rounds, preserving your conversation history.
+Each round has a new candidate directory: re-read the assigned script and start
+from that parent, even if another agent wrote it. Do not edit earlier rounds'
+directories. The parent score and your previous attempt's measured result are
+supplied as feedback, not instructions. Use them and your conversation history
+to avoid repeating failed ideas.
 
 ## One experiment
 

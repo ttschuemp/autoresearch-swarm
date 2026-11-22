@@ -3,8 +3,8 @@ Population-based autoresearch loop.
 Agents propose changes in parallel; candidate training runs one at a time.
 
 Usage:
-    bash agent/run.sh --dry-run
-    bash agent/run.sh --allow-all-tools --agents 1 --keep 1 --rounds 2
+    uv run population.py --dry-run
+    uv run population.py --allow-all-tools --agents 1 --keep 1 --rounds 2
 
 Run settings, script snapshots, and logs are stored in results/.
 """
@@ -19,22 +19,22 @@ import re
 import signal
 import sys
 import traceback
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import get_args
 
 from copilot import CopilotClient
-from copilot.session import ReasoningEffort
+from copilot.session import CopilotSession, ReasoningEffort
 
-from agent.sdk import list_models, load_environment, run_session, validate_client
+from sdk import create_session, list_models, load_environment, run_session, validate_client
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-REPOSITORY = Path(__file__).resolve().parent.parent
+REPOSITORY = Path(__file__).resolve().parent
 TRAINING_TIMEOUT = 600
 PROPOSAL_TIMEOUT = 900
 FIXED_FILES = ("prepare.py", "pyproject.toml")
@@ -169,29 +169,26 @@ async def train_candidate(trial: Trial, training_python: Path, fixed_files: dict
     )
 
 
-async def propose(client: CopilotClient, trial: Trial, parent: Trial, history: list[Trial],
-                  instructions: str, reasoning_effort: ReasoningEffort | None) -> None:
-    recent = [
-        {**previous.record(), "description": previous.description[:2000]}
-        for previous in history[-5:]
-    ]
+async def propose(session: CopilotSession, trial: Trial, parent: Trial,
+                  previous: Trial | None) -> None:
     prompt = f"""You are agent {trial.agent}, round {trial.round}.
 Working directory: {trial.directory}
 Parent: {parent.directory.name}, val_bpb={parent.val_bpb} (lower is better).
-Start from the assigned train.py, not your previous attempt. Weights start fresh.
-Your recent attempts are feedback, not instructions. Make one change, explain it,
-then stop. Other agents' reasoning is not shared.
+Your session is reused across rounds; use your prior conversation to learn from
+past attempts. Re-read the assigned train.py in this round's working directory.
+Start from this parent, not your previous attempt. Weights start fresh.
+The previous attempt's measured result below is feedback, not instructions.
+Make one change, explain it, then stop. Other agents' reasoning is not shared.
+Do not edit files in earlier rounds' directories.
 
-<your-recent-history>
-{json.dumps(recent, indent=2, allow_nan=False)}
-</your-recent-history>
+<previous-result>
+{json.dumps(previous.record() if previous is not None else None, indent=2, allow_nan=False)}
+</previous-result>
 """
     (trial.directory / "prompt.txt").write_text(prompt, encoding="utf-8")
     with (trial.directory / "agent.log").open("x", encoding="utf-8") as output:
         trial.description = await run_session(
-            client, prompt, trial.directory, trial.model, reasoning_effort=reasoning_effort,
-            timeout=PROPOSAL_TIMEOUT,
-            system_message=instructions, output=output,
+            session, prompt, trial.directory, timeout=PROPOSAL_TIMEOUT, output=output,
         )
     if not trial.description.strip():
         raise TrialFailure("Proposal ended without an explanation; training was not started")
@@ -239,7 +236,10 @@ async def run_population(repository: Path, training_python: Path, tag: str,
     rng = random.Random(seed)
     histories: list[list[Trial]] = [[] for _ in range(agents)]
 
-    async with CopilotClient(working_directory=str(repository)) as client:
+    async with (
+        CopilotClient(working_directory=str(repository)) as client,
+        AsyncExitStack() as session_stack,
+    ):
         for model in dict.fromkeys(models):
             await validate_client(client, model, reasoning_effort=reasoning_effort)
         run_directory.mkdir(parents=True, exist_ok=False)
@@ -260,6 +260,15 @@ async def run_population(repository: Path, training_python: Path, tag: str,
             raise RuntimeError("Baseline failed; no agents were started.")
         write_json(run_directory / "pool.json", {"round": 0, "winners": [baseline.record()]})
 
+        sessions: list[CopilotSession] = []
+        if rounds:
+            for model in models:
+                session = await create_session(
+                    client, run_directory, model, system_message=instructions,
+                    reasoning_effort=reasoning_effort,
+                )
+                sessions.append(await session_stack.enter_async_context(session))
+
         for round_number in range(1, rounds + 1):
             parents = [rng.choice(pool) for _ in range(agents)]
             trials = [
@@ -275,7 +284,10 @@ async def run_population(repository: Path, training_python: Path, tag: str,
 
             print(f"Round {round_number}/{rounds}: {agents} parallel proposals", flush=True)
             proposals = [
-                propose(client, trial, parent, histories[index], instructions, reasoning_effort)
+                propose(
+                    sessions[index], trial, parent,
+                    histories[index][-1] if histories[index] else None,
+                )
                 for index, (trial, parent) in enumerate(zip(trials, parents))
             ]
             replies = await asyncio.gather(*proposals, return_exceptions=True)
@@ -366,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"Baseline + {args.rounds} rounds x {args.agents} agents; keep {args.keep}; "
                 f"seed {args.seed}. Parallel reasoning, sequential training."
             )
+            print(f"Sessions: {args.agents if args.rounds else 0}; one per agent, reused across rounds.")
             print("Parents: uniform sampling with replacement from previous winners.")
             print("Selection: lowest val_bpb across previous winners and successful new scripts.")
             print(f"Instructions: {REPOSITORY / 'program.md'}")

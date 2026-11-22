@@ -1,14 +1,14 @@
 """
 Shared Copilot SDK helpers for the population loop.
-Loads credentials, checks models, and runs proposal sessions.
+Loads credentials, checks models, and runs turns in persistent proposal sessions.
 """
 
-import asyncio
 from pathlib import Path
 from typing import TextIO, get_args
 
 from copilot import CopilotClient, ToolSet
-from copilot.session import PermissionHandler, ReasoningEffort
+from copilot.rpc import MetadataSetWorkingDirectoryRequest
+from copilot.session import CopilotSession, PermissionHandler, ReasoningEffort
 from copilot.session_events import (
     AssistantMessageData,
     AssistantMessageDeltaData,
@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 
 def load_environment(repository: Path) -> None:
-    path = repository / "agent" / ".env"
+    path = repository / ".env"
     if path.exists():
         with path.open(encoding="utf-8") as source:
             load_dotenv(stream=source, override=False)
@@ -78,13 +78,13 @@ async def list_models(repository: Path) -> None:
 # Proposal sessions
 # ---------------------------------------------------------------------------
 
-async def run_session(client: CopilotClient, prompt: str, repository: Path, model: str | None,
-                      *, system_message: str, output: TextIO,
-                      reasoning_effort: ReasoningEffort | None = None, timeout: float = 900) -> str:
-    async with await client.create_session(
+async def create_session(client: CopilotClient, directory: Path, model: str | None,
+                         *, system_message: str,
+                         reasoning_effort: ReasoningEffort | None = None) -> CopilotSession:
+    return await client.create_session(
         model=model,
         reasoning_effort=reasoning_effort,
-        working_directory=str(repository),
+        working_directory=str(directory.resolve()),
         on_permission_request=PermissionHandler.approve_all,
         # GPT models edit files with apply_patch; Claude models use edit.
         available_tools=ToolSet().add_builtin(["view", "edit", "apply_patch"]),
@@ -93,36 +93,48 @@ async def run_session(client: CopilotClient, prompt: str, repository: Path, mode
         skip_custom_instructions=True,
         enable_config_discovery=False,
         enable_file_hooks=False,
-    ) as session:
-        print(f"Copilot session: {session.session_id}", file=output, flush=True)
-        streamed: set[str] = set()
+    )
 
-        def on_event(event: SessionEvent) -> None:
-            data = event.data
-            if isinstance(data, AssistantMessageDeltaData) and data.delta_content:
-                streamed.add(data.message_id)
-                print(data.delta_content, end="", file=output, flush=True)
-            elif isinstance(data, AssistantMessageData):
-                if data.message_id in streamed:
-                    streamed.remove(data.message_id)
-                    print(file=output, flush=True)
-                elif data.content:
-                    print(data.content, file=output, flush=True)
-            elif isinstance(data, ToolExecutionStartData):
-                print(f"\n[tool] {data.tool_name}", file=output, flush=True)
-            elif isinstance(data, ToolExecutionCompleteData) and not data.success:
-                detail = data.error.message if data.error else "No error detail provided"
-                print(f"\n[tool failed] {detail}", file=output, flush=True)
-            elif isinstance(data, SessionErrorData):
-                print(f"\n[session error] {data.message}", file=output, flush=True)
 
-        session.on(on_event)
+async def run_session(session: CopilotSession, prompt: str, directory: Path,
+                      *, output: TextIO, timeout: float = 900) -> str:
+    print(f"Copilot session: {session.session_id}", file=output, flush=True)
+    streamed: set[str] = set()
+
+    def on_event(event: SessionEvent) -> None:
+        data = event.data
+        if isinstance(data, AssistantMessageDeltaData) and data.delta_content:
+            streamed.add(data.message_id)
+            print(data.delta_content, end="", file=output, flush=True)
+        elif isinstance(data, AssistantMessageData):
+            if data.message_id in streamed:
+                streamed.remove(data.message_id)
+                print(file=output, flush=True)
+            elif data.content:
+                print(data.content, file=output, flush=True)
+        elif isinstance(data, ToolExecutionStartData):
+            print(f"\n[tool] {data.tool_name}", file=output, flush=True)
+        elif isinstance(data, ToolExecutionCompleteData) and not data.success:
+            detail = data.error.message if data.error else "No error detail provided"
+            print(f"\n[tool failed] {detail}", file=output, flush=True)
+        elif isinstance(data, SessionErrorData):
+            print(f"\n[session error] {data.message}", file=output, flush=True)
+
+    unsubscribe = session.on(on_event)
+    completed = False
+    try:
+        await session.rpc.metadata.set_working_directory(
+            MetadataSetWorkingDirectoryRequest(working_directory=str(directory.resolve())),
+        )
+        response = await session.send_and_wait(prompt, timeout=timeout)
+        if response is None or not isinstance(response.data, AssistantMessageData):
+            raise RuntimeError("Copilot ended without an assistant response.")
+        completed = True
+        return response.data.content
+    finally:
         try:
-            response = await session.send_and_wait(prompt, timeout=timeout)
-            if response is None or not isinstance(response.data, AssistantMessageData):
-                raise RuntimeError("Copilot ended without an assistant response.")
-            return response.data.content
-        except (asyncio.CancelledError, TimeoutError):
-            print("\nStopping the Copilot turn...", file=output, flush=True)
-            await session.abort()
-            raise
+            if not completed:
+                print("\nStopping the Copilot turn...", file=output, flush=True)
+                await session.abort()
+        finally:
+            unsubscribe()
