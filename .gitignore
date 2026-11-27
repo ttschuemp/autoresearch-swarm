@@ -1,0 +1,42 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local credentials (example templates can be committed)
+.env
+.env.*
+!.env.example
+
+# Local caches
+.cache/
+.ipynb_checkpoints/
+
+# Generated research files
+worktrees/
+results/
+queue/
+*.log
+
+# Editor workspace files
+*.code-workspace
+
+# Agent prompt files (generated per-session by launchers)
+CLAUDE.md
+AGENTS.md
+
+# Experimental code/artifacts
+dev/
+
+# Internal setup and launcher scripts (kept locally)
+scripts/
+/run.sh
+
+# Results files
+results.tsv
